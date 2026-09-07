@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python="${TUFAZIP_PYTHON:-python3}"
+input="${1:?usage: ./tufazip enwik9.bin enwik9 [state-directory]}"
+output="${2:?usage: ./tufazip enwik9.bin enwik9 [state-directory]}"
+state="${3:-$PWD/tufazip-state}"
+test "$#" -le 3 || { echo "usage: ./tufazip enwik9.bin enwik9 [state-directory]" >&2; exit 2; }
+
+check() {
+    test -f "$1" || { echo "missing: $1" >&2; exit 1; }
+    test "$(wc -c < "$1" | tr -d '[:space:]')" = "$2" || {
+        echo "wrong size: $1" >&2; exit 1;
+    }
+    test "$(sha256sum "$1" | awk '{print $1}')" = "$3" || {
+        echo "wrong SHA-256: $1" >&2; exit 1;
+    }
+}
+
+check "$input" 105924360 a61841fcaac31d9db9b70dab797ac43f7502fc526326e1e9a326bdde8d24d01b
+check "$root/enwik9.voc" 34421 a63e517783e84a778f3f08c1f2321f3e2035e64d34c8e9206f03591460e44629
+
+"$python" - <<'PY'
+import importlib.metadata
+import platform
+import sys
+import numpy
+import torch
+
+expected = (
+    ("Python", platform.python_version(), "3.12.3"),
+    ("NumPy", numpy.__version__, "2.4.6"),
+    ("PyTorch", torch.__version__, "2.12.0+cu130"),
+    ("TensorBoard", importlib.metadata.version("tensorboard"), "2.20.0"),
+    ("CUDA", torch.version.cuda, "13.0"),
+    ("cuDNN", torch.backends.cudnn.version(), 92000),
+)
+errors = [f"{name}: found {actual!r}, expected {wanted!r}"
+          for name, actual, wanted in expected if actual != wanted]
+if not torch.cuda.is_available():
+    errors.append("CUDA is unavailable")
+elif torch.cuda.device_count() != 2:
+    errors.append(f"found {torch.cuda.device_count()} visible GPUs; expected 2")
+elif any("B200" not in torch.cuda.get_device_name(i) for i in range(2)):
+    errors.append("both visible GPUs must be NVIDIA B200s")
+if platform.machine() not in ("x86_64", "AMD64"):
+    errors.append("x86-64 is required")
+if errors:
+    print("unsupported deterministic runtime:\n  " + "\n  ".join(errors), file=sys.stderr)
+    sys.exit(1)
+PY
+
+mkdir -p "$state/checkpoint" "$state/run" "$(dirname "$output")"
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+export PYTHONHASHSEED=1111
+export NCCL_ALGO=Ring
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+rm -f "$state/checkpoint/STOP_REQUESTED"
+
+stop() {
+    echo "stopping after the next checkpoint; repeat this command to resume" >&2
+    touch "$state/checkpoint/STOP_REQUESTED"
+}
+trap stop USR1 TERM INT
+
+if ! test -f "$state/checkpoint/DONE"; then
+    set +e
+    "$python" -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=2 \
+        "$root/nn.py" --distributed --decompress \
+        --input "$input" --output "$state/enwik9.pp" \
+        --raw_bytes 1000000000 --vocab_bytes 34421 \
+        --model_backend transformer --vocab_size 4097 --tokenizer word \
+        --n_layer 12 --d_model 1024 --n_head 8 --d_inner 2816 \
+        --ctx_len 192 --untie_embeddings --dropout 0.25 \
+        --batch_size 64 --block_len 500000 \
+        --online_loss code --project_only_targets \
+        --lr 4e-5 --min_lr_ratio 0.25 --warmup 200 \
+        --clip 0.25 --beta1 0 --beta2 0.9999 --adam_eps 1e-9 \
+        --retrain_period 1 --retrain_len 35000000 --retrain_epochs 1 \
+        --retrain_batch_size 32 --retrain_update_len 64 \
+        --retrain_lr 1.6e-4,13000,1.6e-4,93000,7.9e-5,163000,4.0e-5,1911300,1.3e-5 \
+        --position_type rope --norm_style peri --seed 1111 --dtype bf16 \
+        --log_interval 100000 --run_dir "$state/run" \
+        --checkpoint_dir "$state/checkpoint" --checkpoint_every_blocks 2 &
+    pid=$!
+    while true; do
+        wait "$pid"
+        status=$?
+        ! kill -0 "$pid" 2>/dev/null && break
+    done
+    set -e
+    test "$status" -eq 0 || exit "$status"
+fi
+
+check "$state/enwik9.pp" 570405660 102fa82b3f8932b37a1ec0d9262e555d23d17852685fe5fb33680dbee19dd694
+gcc -O3 -Wall -Wpointer-arith -g -fno-math-errno -fno-trapping-math \
+    -Wno-format-truncation -DCONFIG_VERSION=\"tufazip\" \
+    -I"$root" "$root/preprocess.c" -lm -o "$state/preprocess"
+"$state/preprocess" d "$root/enwik9.voc" "$state/enwik9.pp" "$output"
+check "$output" 1000000000 159b85351e5f76e60cbe32e04c677847a9ecba3adc79addab6f4c6c7aa3744bc
+echo "decoded and verified: $output"

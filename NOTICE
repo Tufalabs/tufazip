@@ -1,0 +1,6 @@
+Third-party MIT-licensed code:
+
+- NNCP preprocessor: Copyright (c) 2018-2019 Fabrice Bellard.
+  https://bellard.org/nncp/ (`preprocess.c` contains the license notice.)
+- Reference arithmetic coder: Copyright (c) 2026 Project Nayuki.
+  https://github.com/nayuki/Reference-arithmetic-coding

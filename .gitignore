@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+*.py[cod]
+preprocess
+*.o
+*.d
+tufazip-state/
+dist/
+enwik9
+enwik9.bin
