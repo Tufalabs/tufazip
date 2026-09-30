@@ -1,5 +1,5 @@
 /*
- * TufaZip preprocessor
+ * NNCP preprocessor
  * 
  * Copyright (c) 2018-2019 Fabrice Bellard
  *
@@ -32,7 +32,24 @@
 #include <stdarg.h>
 #include <getopt.h>
 
-#include "cutils.h"
+typedef int BOOL;
+enum { FALSE = 0, TRUE = 1 };
+
+static inline int min_int(int a, int b)
+{
+    if (a < b)
+        return a;
+    else
+        return b;
+}
+
+static inline size_t max_size_t(size_t a, size_t b)
+{
+    if (a > b)
+        return a;
+    else
+        return b;
+}
 
 void *mallocz(int size)
 {

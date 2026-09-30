@@ -1,23 +1,23 @@
-"""Deterministic online neural compression used by TufaZip.
+"""tufazip v2: Transformer, packed-weight reader and online arithmetic codec.
 
-The preprocessor converts bytes into a big-endian 16-bit token stream. A
-language model assigns probabilities to each token, and an arithmetic coder
-maps those probabilities to or from the compressed bitstream.
-
-Encoding and decoding begin from the same seeded initialization and repeat the
-same online and replay updates. Bit-exact decoding therefore requires the
-recorded hardware and software environment.
+V2_CONFIG holds the fixed settings for the verified enwik9 bitstream.
+weights.bin supplies the Cycle2 initialization; encoding and decoding then
+reproduce the same online learning steps. Deterministic decoding requires the
+matching two-B200 hardware and pinned runtime documented in README.md.
 """
 import os
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # deterministic cuBLAS
 os.environ.setdefault("TRITON_CACHE_AUTOTUNING", "1")  # deterministic custom kernels
 
 import argparse
+import hashlib
 import io
+import json
 import math
 import time
 import zipfile
 import sys
+import struct
 
 import numpy as np
 import torch
@@ -34,17 +34,60 @@ from checkpoint_utils import (
     capture_rng_state, checkpoint_path, config_signature, flush_and_sync,
     load_checkpoint, mark_done, restore_rng_state, stop_requested)
 
+# The fixed settings used to create the v2 enwik9 bitstream.
+# The decoder must reproduce the same initialization and online updates.
+V2_CONFIG = {'distributed': True,
+ 'raw_bytes': 1000000000,
+ 'vocab_bytes': 34421,
+ 'vocab_size': 4097,
+ 'tokenizer': 'word',
+ 'n_layer': 12,
+ 'd_model': 1024,
+ 'n_head': 8,
+ 'd_inner': 2816,
+ 'ctx_len': 192,
+ 'untie_embeddings': True,
+ 'dropout': 0.25,
+ 'batch_size': 64,
+ 'block_len': 500000,
+ 'online_loss': 'code',
+ 'project_only_targets': True,
+ 'lr': 4e-05,
+ 'min_lr_ratio': 0.25,
+ 'warmup': 200,
+ 'clip': 0.25,
+ 'adam_eps': 1e-09,
+ 'retrain_period': 1,
+ 'retrain_len': 35000000,
+ 'retrain_epochs': 1,
+ 'retrain_batch_size': 32,
+ 'retrain_update_len': 64,
+ 'retrain_lr': '1.6e-4,13000,1.6e-4,93000,7.9e-5,163000,4.0e-5,1911300,1.3e-5',
+ 'position_type': 'rope',
+ 'norm_style': 'peri',
+ 'dtype': 'bf16',
+ 'log_interval': 100000,
+ 'checkpoint_every_blocks': 4,
+ 'model_backend': 'transformer',
+ 'seed': 1111,
+ 'beta1': 0.0,
+ 'beta2': 0.9999}
+
+
 LOG2 = math.log(2.0)
 FREQ_TOTAL = 10_000_000  # frequency-table resolution handed to the arithmetic coder
 
-# Source files needed to decode an archive. The word tokenizer ships its small
-# C preprocessor sources; Python tokenizers ship tokenizers.py.
+# Files that must ship with this script to decompress its output, used for the
+# Matt Mahoney "total size" benchmark (compressed bytes + DEFLATE-9 zip of these).
+# Which detokenizer source is needed depends on the tokenizer: the C 'word' path
+# needs the standalone preprocess.c source; the
+# byte*/bpe* paths need tokenizers.py instead.
 DECOMPRESSOR_COMMON = (
     "nn.py", "arithmetic_coder.py", "checkpoint_utils.py")
 DECOMPRESSOR_MAMBA = (
     "ssm_models.py", "mamba_ssm_commit.txt", "mamba_ssm_compat.py")
 DECOMPRESSOR_KDA = ("ssm_models.py", "kda_models.py", "fla_commit.txt")
-DECOMPRESSOR_WORD = ("preprocess.c", "cutils.h", "Makefile")
+DECOMPRESSOR_WORD = ("preprocess.c",)
 DECOMPRESSOR_STRUCTURED = ("structured_word_transform.py",)
 DECOMPRESSOR_PY = ("tokenizers.py",)
 
@@ -65,12 +108,14 @@ def decompressor_files(tokenizer, model_backend="transformer"):
     return DECOMPRESSOR_COMMON + model_files + extra
 
 
-def decompressor_zip_size(files):
+def decompressor_zip_size(files, extra_files=()):
     root = os.path.dirname(os.path.abspath(__file__))
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
         for f in files:
             zf.write(os.path.join(root, f), arcname=f)
+        for path in extra_files:
+            zf.write(path, arcname=os.path.basename(path))
     return buf.tell()
 
 
@@ -122,7 +167,9 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.d_head) if qk_norm else nn.Identity()
         self.k_norm = RMSNorm(self.d_head) if qk_norm else nn.Identity()
         if position_type == "learned_relative":
-            # Learned relative attention combines content and distance terms.
+            # Bellard/Transformer-XL-style learned relative attention:
+            # content bias, a content-dependent distance term, and a global
+            # learned bias for every relative distance.
             self.r_emb = nn.Parameter(
                 torch.empty(ctx_len, n_head, self.d_head))
             self.r_w_bias = nn.Parameter(torch.empty(n_head, self.d_head))
@@ -215,9 +262,22 @@ class Block(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, vocab_size, n_layer, d_model, n_head, d_inner,
                  ctx_len, dropout, rope_base=10000.0, tie_emb=True,
-                 position_type="rope", qk_norm=True, norm_style="peri"):
+                 position_type="rope", qk_norm=True, norm_style="peri",
+                 block_schedule=None):
         super().__init__()
         self.position_type = position_type
+        if block_schedule is None:
+            block_schedule = tuple(range(n_layer))
+        else:
+            block_schedule = tuple(int(index) for index in block_schedule)
+            if not block_schedule:
+                raise ValueError("block_schedule cannot be empty")
+            if min(block_schedule) < 0 or max(block_schedule) >= n_layer:
+                raise ValueError("block_schedule index is outside n_layer")
+            if set(block_schedule) != set(range(n_layer)):
+                raise ValueError(
+                    "block_schedule must use every physical block")
+        self.block_schedule = block_schedule
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         # Peri-LN also normalizes at the embedding boundary so the first block
         # sees the same well-conditioned input every other block sees.
@@ -243,8 +303,9 @@ class Transformer(nn.Module):
             self.rope_cos = self.rope_sin = None
 
         self.apply(self._init_weights)
-        # GPT-2 style scaling of the residual projections by 1/sqrt(2 * n_layer)
-        residual_std = 0.02 / math.sqrt(2 * n_layer)
+        # Scale by executed rather than stored depth. This gives a looped model
+        # the same initialization scale as the untied target it will become.
+        residual_std = 0.02 / math.sqrt(2 * len(self.block_schedule))
         for name, param in self.named_parameters():
             if name.endswith("proj.weight") or name.endswith("down.weight"):
                 nn.init.normal_(param, mean=0.0, std=residual_std)
@@ -262,8 +323,8 @@ class Transformer(nn.Module):
         else:
             cos = sin = None
         x = self.drop(self.emb_norm(self.tok_emb(idx)))
-        for block in self.blocks:
-            x = block(x, cos, sin)
+        for block_index in self.block_schedule:
+            x = self.blocks[block_index](x, cos, sin)
         x = self.norm(x)
         # Online coding supervises only the newest position, and replay may
         # prepend context whose logits are never used.  Slice hidden states
@@ -273,6 +334,308 @@ class Transformer(nn.Module):
         if output_positions is not None:
             x = x[:, output_positions]
         return self.head(x)
+
+
+# Packed offline weights: QPI1 header, tensor metadata, scales and bit codes.
+ARCHIVE_VERSION = 1
+
+
+def _packed_size(num_values, bits):
+    if bits == 16:
+        return num_values * 2
+    return (num_values * bits + 7) // 8
+
+def _unpack_codes(payload, count, bits):
+    packed = np.frombuffer(payload, dtype=np.uint8)
+    if bits == 8:
+        return packed[:count].copy()
+    per_byte = 8 // bits
+    shifts = np.arange(per_byte, dtype=np.uint16) * bits
+    values = (
+        (packed.astype(np.uint16)[:, None] >> shifts[None, :])
+        & ((1 << bits) - 1))
+    return values.reshape(-1)[:count].astype(np.uint8)
+
+def read_tensor_archive(path):
+    """Decode an archive into the exact float32 tensors seen by inference."""
+    with open(path, "rb") as source:
+        magic = source.read(4)
+        if magic not in (b"QPR1", b"QPI1", b"LRA1", b"QLA1"):
+            raise ValueError("Unknown tensor archive magic: {!r}".format(magic))
+        length_bytes = source.read(8)
+        if len(length_bytes) != 8:
+            raise ValueError("Truncated tensor archive header")
+        metadata_length = struct.unpack("<Q", length_bytes)[0]
+        metadata_payload = source.read(metadata_length)
+        if len(metadata_payload) != metadata_length:
+            raise ValueError("Truncated tensor archive metadata")
+        metadata = json.loads(metadata_payload.decode("utf-8"))
+        if metadata.get("version") != ARCHIVE_VERSION:
+            raise ValueError("Unsupported tensor archive version")
+
+        tensors = {}
+        for entry in metadata["entries"]:
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError("Archive tensor name must be a non-empty string")
+            if name in tensors:
+                raise ValueError("Duplicate archive tensor: {}".format(name))
+            shape = tuple(entry["shape"])
+            if not shape or any(
+                    not isinstance(size, int) or size < 1 for size in shape):
+                raise ValueError("Invalid tensor shape for {}".format(name))
+            count = int(np.prod(shape))
+            bits = int(entry["bits"])
+            if bits not in (1, 2, 4, 8, 16):
+                raise ValueError("Unsupported bit width for {}".format(name))
+            expected_value_bytes = _packed_size(count, bits)
+            if int(entry["value_bytes"]) != expected_value_bytes:
+                raise ValueError("Invalid packed size for {}".format(name))
+            expected_scale_count = (
+                shape[0] if len(shape) >= 2 else 1) if bits < 16 else 0
+            if int(entry["scale_count"]) != expected_scale_count:
+                raise ValueError("Invalid scale count for {}".format(name))
+            if int(entry["scale_bytes"]) != expected_scale_count * 2:
+                raise ValueError("Invalid scale size for {}".format(name))
+            if bits == 16:
+                payload = source.read(entry["value_bytes"])
+                if len(payload) != entry["value_bytes"]:
+                    raise ValueError(
+                        "Truncated values for {}".format(entry["name"]))
+                value = np.frombuffer(
+                    payload, dtype=np.float16).astype(
+                        np.float32).reshape(shape)
+            else:
+                scale_payload = source.read(entry["scale_bytes"])
+                if len(scale_payload) != entry["scale_bytes"]:
+                    raise ValueError(
+                        "Truncated scales for {}".format(entry["name"]))
+                scales = np.frombuffer(
+                    scale_payload, dtype=np.float16).astype(np.float32)
+                value_payload = source.read(entry["value_bytes"])
+                if len(value_payload) != entry["value_bytes"]:
+                    raise ValueError(
+                        "Truncated values for {}".format(entry["name"]))
+                codes = _unpack_codes(value_payload, count, bits)
+                if bits == 1:
+                    signed = codes.astype(np.int16) * 2 - 1
+                else:
+                    signed = (
+                        codes.astype(np.int16)
+                        - ((1 << (bits - 1)) - 1))
+                if len(shape) >= 2:
+                    scale_shape = (shape[0],) + (1,) * (len(shape) - 1)
+                else:
+                    scale_shape = (1,)
+                value = (
+                    signed.astype(np.float32).reshape(shape)
+                    * scales.reshape(scale_shape))
+            tensors[name] = torch.from_numpy(
+                np.array(value, dtype=np.float32, copy=True))
+
+        if source.read(1):
+            raise ValueError("Tensor archive has trailing bytes")
+    metadata["magic"] = magic.decode("ascii")
+    metadata["archive_bytes"] = os.path.getsize(path)
+    return tensors, metadata
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while True:
+            chunk = source.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def depth_block_mapping(source_depth, target_depth):
+    """Evenly place ordered source blocks in a deeper target model."""
+    source_depth = int(source_depth)
+    target_depth = int(target_depth)
+    if source_depth < 1 or source_depth > target_depth:
+        raise ValueError(
+            "source depth must be between 1 and target depth")
+    return [index * target_depth // source_depth
+            for index in range(source_depth)]
+
+
+def parse_block_schedule(value, n_layer):
+    """Parse a comma-separated recurrent-depth schedule."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, str):
+        try:
+            schedule = [int(item) for item in value.split(",")]
+        except ValueError as error:
+            raise ValueError(
+                "block_schedule must contain comma-separated integers") from error
+    else:
+        schedule = [int(item) for item in value]
+    if not schedule:
+        raise ValueError("block_schedule cannot be empty")
+    if min(schedule) < 0 or max(schedule) >= int(n_layer):
+        raise ValueError("block_schedule index is outside n_layer")
+    if set(schedule) != set(range(int(n_layer))):
+        raise ValueError("block_schedule must use every physical block")
+    return schedule
+
+
+def transformer_geometry(
+        vocab_size, n_layer, d_model, n_head, d_inner, ctx_len,
+        tie_embeddings, position_type, qk_norm, norm_style):
+    return {
+        "vocab_size": int(vocab_size),
+        "n_layer": int(n_layer),
+        "d_model": int(d_model),
+        "n_head": int(n_head),
+        "d_inner": int(d_inner),
+        "ctx_len": int(ctx_len),
+        "tie_embeddings": bool(tie_embeddings),
+        "position_type": str(position_type),
+        "qk_norm": bool(qk_norm),
+        "norm_style": str(norm_style),
+    }
+
+
+def model_state_sha256(model):
+    """Hash names, shapes, dtypes, and exact CPU parameter bytes."""
+    digest = hashlib.sha256()
+    for name, tensor in sorted(model.state_dict().items()):
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(str(tuple(value.shape)).encode("ascii") + b"\0")
+        digest.update(str(value.dtype).encode("ascii") + b"\0")
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def load_depth_prior(model, archive_path, vocab_file, expected_geometry, seed):
+    """Load a QPI1 depth-growth or loop-untying initialization."""
+    if not vocab_file:
+        raise ValueError("--vocab_file is required with --initial_prior")
+    if not os.path.isfile(vocab_file):
+        raise ValueError("Vocabulary file does not exist: {}".format(vocab_file))
+    tensors, metadata = read_tensor_archive(archive_path)
+    if metadata.get("magic") != "QPI1":
+        raise ValueError("--initial_prior requires a QPI1 archive")
+    initialization = metadata.get("initialization")
+    if not isinstance(initialization, dict):
+        raise ValueError("QPI1 archive lacks initialization metadata")
+    initialization_kind = initialization.get("kind")
+    if initialization_kind not in ("depth-growth", "loop-untying"):
+        raise ValueError("Unsupported initialization kind")
+    if initialization.get("target_geometry") != expected_geometry:
+        raise ValueError("Prior target geometry differs from this invocation")
+    source_geometry = initialization.get("source_geometry")
+    if not isinstance(source_geometry, dict):
+        raise ValueError("QPI1 archive lacks source geometry")
+    for key, value in expected_geometry.items():
+        if key != "n_layer" and source_geometry.get(key) != value:
+            raise ValueError(
+                "Prior source geometry differs at {}".format(key))
+    source_depth = int(source_geometry.get("n_layer", 0))
+    target_depth = int(expected_geometry["n_layer"])
+    if initialization_kind == "depth-growth":
+        mapping = depth_block_mapping(source_depth, target_depth)
+        if initialization.get("block_mapping") != mapping:
+            raise ValueError(
+                "Prior block mapping is not the canonical depth mapping")
+        target_sources = {
+            target_index: source_index
+            for source_index, target_index in enumerate(mapping)
+        }
+        block_schedule = None
+    else:
+        block_schedule = parse_block_schedule(
+            initialization.get("block_schedule"), source_depth)
+        if block_schedule is None:
+            raise ValueError("Loop prior lacks a block schedule")
+        if len(block_schedule) != target_depth:
+            raise ValueError(
+                "Loop prior schedule length differs from target depth")
+        mapping = list(block_schedule)
+        target_sources = {
+            target_index: source_index
+            for target_index, source_index in enumerate(block_schedule)
+        }
+    if int(initialization.get("initialization_seed", -1)) != int(seed):
+        raise ValueError("Prior initialization seed differs from --seed")
+    vocab_digest = sha256_file(vocab_file)
+    if initialization.get("vocab_sha256") != vocab_digest:
+        raise ValueError("Prior vocabulary digest differs from --vocab_file")
+
+    target_state = model.state_dict()
+    root_names = {
+        name for name in target_state if not name.startswith("blocks.")}
+    block_suffixes = {
+        name.split(".", 2)[2]
+        for name in target_state if name.startswith("blocks.0.")}
+    expected_source_names = set(root_names)
+    for source_index in range(source_depth):
+        expected_source_names.update(
+            "blocks.{}.{}".format(source_index, suffix)
+            for suffix in block_suffixes)
+    if set(tensors) != expected_source_names:
+        missing = sorted(expected_source_names - set(tensors))
+        extra = sorted(set(tensors) - expected_source_names)
+        raise ValueError(
+            "Prior tensor set is incomplete: missing={} extra={}".format(
+                missing, extra))
+
+    with torch.no_grad():
+        for name in root_names:
+            if tuple(tensors[name].shape) != tuple(target_state[name].shape):
+                raise ValueError("Prior tensor shape differs for {}".format(name))
+            target_state[name].copy_(tensors[name].to(target_state[name].dtype))
+        for target_index, source_index in sorted(target_sources.items()):
+            for suffix in block_suffixes:
+                source_name = "blocks.{}.{}".format(source_index, suffix)
+                target_name = "blocks.{}.{}".format(target_index, suffix)
+                if tuple(tensors[source_name].shape) != tuple(
+                        target_state[target_name].shape):
+                    raise ValueError(
+                        "Prior tensor shape differs for {}".format(source_name))
+                target_state[target_name].copy_(
+                    tensors[source_name].to(target_state[target_name].dtype))
+        if initialization_kind == "depth-growth":
+            mapped_targets = set(target_sources)
+            for target_index in range(target_depth):
+                if target_index in mapped_targets:
+                    continue
+                target_state[
+                    "blocks.{}.attn.proj.weight".format(target_index)].zero_()
+                target_state[
+                    "blocks.{}.ffn.down.weight".format(target_index)].zero_()
+
+    return {
+        "archive_bytes": os.path.getsize(archive_path),
+        "archive_sha256": sha256_file(archive_path),
+        "vocab_sha256": vocab_digest,
+        "initialization_kind": initialization_kind,
+        "source_depth": source_depth,
+        "block_mapping": mapping,
+        "block_schedule": block_schedule,
+        "initial_state_sha256": model_state_sha256(model),
+        "metadata": metadata,
+    }
+
+
+def validate_checkpoint_prior(resume_state, prior_info):
+    """Require resume to use the exact transmitted initialization identity."""
+    requested_prior_digest = (
+        prior_info["archive_sha256"] if prior_info is not None else None)
+    if resume_state.get("initial_prior_sha256") != requested_prior_digest:
+        raise ValueError(
+            "Checkpoint initial-prior digest differs from this invocation")
+    requested_vocab_digest = (
+        prior_info["vocab_sha256"] if prior_info is not None else None)
+    if resume_state.get(
+            "initial_prior_vocab_sha256") != requested_vocab_digest:
+        raise ValueError(
+            "Checkpoint prior-vocabulary digest differs from this invocation")
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +711,7 @@ class NullSummaryWriter:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="TufaZip neural arithmetic codec")
+        description="tufazip v2 neural codec")
     # I/O
     p.add_argument("--input", type=str, required=True)
     p.add_argument("--output", type=str, help="output file (defaults under --work_dir)")
@@ -362,6 +725,10 @@ def parse_args():
                         "enables bits/byte logging (the enwik benchmark metric)")
     p.add_argument("--vocab_bytes", type=int, default=0,
                    help="serialized vocabulary size for separate benchmark-total metrics")
+    p.add_argument("--vocab_file", type=str, default="",
+                   help="serialized vocabulary whose SHA-256 is pinned by a QPI1 prior")
+    p.add_argument("--initial_prior", type=str, default="",
+                   help="transmitted QPI1 shallow-model initialization archive")
     p.add_argument("--external_decompressor_bytes", type=int, default=-1,
                    help="compressed bytes for external runtime dependencies; required "
                         "before reporting a non-Transformer benchmark total "
@@ -383,16 +750,18 @@ def parse_args():
     # (SwiGLU has 3 matrices vs ReLU's 2, so 4 * 2/3 = 8/3).  For d_model=512:
     #   8/3 * 512 = 1365.33  ->  rounded up to multiple of 256  ->  1536.
     p.add_argument("--d_inner", type=int, default=1536)
-    # Longer windows capture references beyond the local token neighborhood.
-    # The arithmetic coder dominates wall time, so moderate context increases
-    # have a smaller end-to-end cost than their raw model FLOPs suggest.
+    # ctx_len = 512 is a conservative bump from the original 128: the Python
+    # arithmetic coder dominates wall time, so the ~4x extra compute per step
+    # is mostly absorbed, and longer windows capture entity/structure references
+    # that span far more than 128 tokens.  Bellard's NNCP v2 effectively used
+    # ~1024; go higher if your GPU has headroom.
     p.add_argument("--ctx_len", type=int, default=512, help="context window length")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--untie_embeddings", action="store_true",
                    help="use a separate output embedding instead of tying it to the input")
     p.add_argument("--position_type", choices=["rope", "learned_relative"],
                    default="rope",
-                   help="RoPE or learned relative attention")
+                   help="RoPE or Bellard-style learned relative attention")
     p.add_argument("--no_qk_norm", action="store_true",
                    help="disable per-head RMSNorm on queries and keys")
     p.add_argument("--norm_style", choices=["peri", "post"], default="peri",
@@ -423,8 +792,8 @@ def parse_args():
     p.add_argument("--min_lr_ratio", type=float, default=0.1)
     p.add_argument("--warmup", type=int, default=200)
     p.add_argument("--online_loss", choices=["window", "code"], default="window",
-                   help="window trains all context targets; code trains only the "
-                        "newly coded target")
+                   help="window repeats all context targets (legacy); code trains only "
+                        "the newly coded target, matching NNCP's online exposure")
     p.add_argument("--project_only_targets", action="store_true",
                    help="apply the vocabulary head only to supervised positions; "
                         "requires --online_loss code and changes no transformer "
@@ -478,6 +847,9 @@ def parse_args():
                         "stop request always checkpoints at the next block boundary")
     p.add_argument("--stop_after_blocks", type=int, default=0,
                    help=argparse.SUPPRESS)
+    p.set_defaults(**V2_CONFIG,
+                   vocab_file=os.path.join(os.path.dirname(__file__), "enwik9.voc"),
+                   initial_prior=os.path.join(os.path.dirname(__file__), "weights.bin"))
     return p.parse_args()
 
 
@@ -501,6 +873,11 @@ def main():
         raise ValueError("early replay settings cannot be negative")
     if args.external_decompressor_bytes < -1:
         raise ValueError("--external_decompressor_bytes must be -1 or nonnegative")
+    if args.initial_prior and args.model_backend != "transformer":
+        raise ValueError("--initial_prior currently supports only Transformer models")
+    if args.initial_prior and not os.path.isfile(args.initial_prior):
+        raise ValueError("Initial prior does not exist: {}".format(
+            args.initial_prior))
 
     launched_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if launched_world_size > 1 and not args.distributed:
@@ -536,8 +913,9 @@ def main():
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    # Put the main configuration in the run name; the full configuration is logged.
-    model_tag = args.model_backend
+    # run dir name: timestamp + key configs (dataset from --input, model family from
+    # the script name) so runs are distinguishable at a glance; full config is in HParams.
+    model_tag = "modern" if args.model_backend == "transformer" else args.model_backend
     dataset_tag = os.path.splitext(os.path.basename(args.input))[0]
     run_tag = "{}-{}-{}-{}-v{}-L{}-d{}-ctx{}".format(
         time.strftime("%Y%m%d-%H%M%S"), model_tag, dataset_tag,
@@ -563,6 +941,7 @@ def main():
         if not is_main:
             return
         print(msg, flush=True)
+        os.makedirs(run_dir, exist_ok=True)
         with open(log_path, "a") as f:
             f.write(msg + "\n")
 
@@ -600,9 +979,18 @@ def main():
             allow_neg_eigval=args.kda_allow_neg_eigval,
             safe_gate=args.kda_safe_gate,
             lower_bound=args.kda_lower_bound)
+    prior_info = None
+    if args.initial_prior:
+        expected_geometry = transformer_geometry(
+            args.vocab_size, args.n_layer, args.d_model, args.n_head,
+            args.d_inner, args.ctx_len, not args.untie_embeddings,
+            args.position_type, not args.no_qk_norm, args.norm_style)
+        prior_info = load_depth_prior(
+            model, args.initial_prior, args.vocab_file,
+            expected_geometry, args.seed)
     model_core = model.to(device)
-    # Online coding uses eval mode; replay may enable dropout through a matched
-    # deterministic profile.
+    # Gradients work in eval mode. Keeping online coding in eval mode lets a
+    # matched profile enable dropout only during prefix retraining, as NNCP does.
     model_core.eval()
     if args.distributed:
         model = DistributedDataParallel(
@@ -636,8 +1024,17 @@ def main():
     log("    - distributed_world_size : {}".format(world_size))
     log("=" * 72)
     log("#params = {} (#non-embedding = {})".format(n_params, n_params_nonemb))
-    dfiles = decompressor_files(args.tokenizer, args.model_backend)
-    local_decompressor_bytes = decompressor_zip_size(dfiles)
+    base_dfiles = decompressor_files(args.tokenizer, args.model_backend)
+    base_decompressor_bytes = decompressor_zip_size(base_dfiles)
+    if prior_info is not None:
+        dfiles = base_dfiles
+        local_decompressor_bytes = decompressor_zip_size(
+            dfiles, extra_files=(args.initial_prior,))
+    else:
+        dfiles = base_dfiles
+        local_decompressor_bytes = base_decompressor_bytes
+    prior_transmission_bytes = (
+        local_decompressor_bytes - base_decompressor_bytes)
     dependency_accounted = (
         args.model_backend == "transformer" or
         args.external_decompressor_bytes >= 0)
@@ -645,6 +1042,16 @@ def main():
         local_decompressor_bytes + max(0, args.external_decompressor_bytes))
     log("local decompressor zip ({} files) = {} bytes".format(
         len(dfiles), local_decompressor_bytes))
+    if prior_info is not None:
+        log("initial prior raw={} bytes transmitted_zip_delta={} bytes "
+            "sha256={} kind={} source_depth={} mapping={} "
+            "state_sha256={}".format(
+                prior_info["archive_bytes"], prior_transmission_bytes,
+                prior_info["archive_sha256"],
+                prior_info["initialization_kind"],
+                prior_info["source_depth"],
+                prior_info["block_mapping"],
+                prior_info["initial_state_sha256"]))
     if args.model_backend in ("mamba2", "mamba3"):
         log("SSM kernel chunk size = {}".format(model_core.effective_chunk_size))
     elif args.model_backend == "kda":
@@ -660,10 +1067,13 @@ def main():
     signature_excluded = {
         "input", "output", "work_dir", "run_name", "run_dir",
         "checkpoint_dir", "checkpoint_every_blocks", "stop_after_blocks",
+        # Paths may move between encoder and decoder. QPI1 contents are pinned
+        # separately by the archive and vocabulary SHA-256 values.
+        "initial_prior", "vocab_file",
         # Accounting does not affect predictions or optimizer updates.
         "external_decompressor_bytes",
         # Stored and checked separately below so checkpoints written
-        # before this option existed remain resumable in the default mode.
+        # before this option existed remain resumable in legacy mode.
         "project_only_targets",
         # Likewise, old checkpoints predate the optional early replay
         # override. Missing values mean the disabled/default policy.
@@ -679,7 +1089,7 @@ def main():
         "kda_lower_bound",
     }
     if args.model_backend == "transformer":
-        # Options for unused backends do not affect Transformer checkpoints.
+        # Keep pre-SSM Transformer checkpoint signatures byte-for-byte stable.
         signature_excluded.update(
             {"model_backend"} | mamba_signature_args | kda_signature_args)
     elif args.model_backend in ("mamba2", "mamba3"):
@@ -714,6 +1124,7 @@ def main():
             raise ValueError(
                 "Checkpoint world size {} differs from this invocation {}"
                 .format(checkpoint_world_size, world_size))
+        validate_checkpoint_prior(resume_state, prior_info)
         model_core.load_state_dict(resume_state["model"])
         optimizer.load_state_dict(resume_state["optimizer"])
         retrain_optimizer.load_state_dict(resume_state["retrain_optimizer"])
@@ -809,7 +1220,7 @@ def main():
         return bounded_step * args.raw_bytes // original_len
 
     def add_scalar(tag, value, symbol_step):
-        """Log token-step and cross-tokenizer source-step views."""
+        """Log legacy token-step and cross-tokenizer source-step views."""
         writer.add_scalar(tag, value, symbol_step)
         if args.raw_bytes:
             writer.add_scalar(
@@ -873,7 +1284,7 @@ def main():
                 # Each target is optimized exactly once, while earlier known
                 # tokens provide up to ctx_len positions of conditioning.
                 # Keep the zero/default path byte-for-byte equivalent to the
-                # non-overlapping replay path.
+                # original non-overlapping retraining implementation.
                 context_start = (max(0, start - (ctx_len - length))
                                  if args.retrain_update_len else start)
                 prefix_len = start - context_start
@@ -982,6 +1393,10 @@ def main():
             "original_len": original_len,
             "file_len": file_len,
             "distributed_world_size": world_size,
+            "initial_prior_sha256": (
+                prior_info["archive_sha256"] if prior_info is not None else None),
+            "initial_prior_vocab_sha256": (
+                prior_info["vocab_sha256"] if prior_info is not None else None),
             "model": model_core.state_dict(),
             "optimizer": optimizer.state_dict(),
             "retrain_optimizer": retrain_optimizer.state_dict(),
@@ -1087,8 +1502,9 @@ def main():
             n_bits += code_nats.item() / LOG2
             n_symbols += batch
 
-            # `code` trains only the new symbol, giving each online target
-            # approximately equal exposure. `window` also trains context targets.
+            # The legacy modern experiment trained every overlapping target in
+            # the window. `code` trains only the new symbol, like NNCP v2, so
+            # each online target has approximately equal exposure.
             if args.online_loss == "code":
                 loss = F.cross_entropy(code_logits, code_targets)
             else:
@@ -1214,9 +1630,15 @@ def main():
     metrics = {"hparam/bits_per_token": final_bpt,
                "hparam/perplexity": math.exp(final_bpt * LOG2),
                "hparam/bytes": n_bits / 8.0,
+               "hparam/base_decompressor_bytes": base_decompressor_bytes,
                "hparam/local_decompressor_bytes": local_decompressor_bytes,
+               "hparam/prior_transmission_bytes": prior_transmission_bytes,
                "hparam/vocab_bytes": args.vocab_bytes,
                "hparam/kSymbols_per_s": n_symbols / (total_time * 1000.0)}
+    if prior_info is not None:
+        metrics["hparam/prior_archive_bytes"] = prior_info["archive_bytes"]
+        add_scalar("final/prior_transmission_bytes",
+                   prior_transmission_bytes, n_symbols)
     if dependency_accounted:
         metrics["hparam/decompressor_bytes"] = decompressor_bytes
         metrics["hparam/total_size"] = (
@@ -1253,6 +1675,45 @@ def main():
                 benchmark_total_bytes,
                 " ({:.6f} bits/byte)".format(benchmark_total_bpb)
                 if benchmark_total_bpb is not None else ""))
+
+    estimated_total_bytes = (
+        n_bits / 8.0 + args.vocab_bytes + decompressor_bytes
+        if dependency_accounted else None)
+    final_result = {
+        "symbols": n_symbols,
+        "modeled_bits": n_bits,
+        "modeled_payload_bytes": n_bits / 8.0,
+        "modeled_bits_per_token": final_bpt,
+        "modeled_bits_per_byte": bits_per_byte,
+        "actual_compressed_bytes": actual_compressed_bytes,
+        "actual_bits_per_byte": actual_bits_per_byte,
+        "vocab_bytes": args.vocab_bytes,
+        "base_decompressor_zip_bytes": base_decompressor_bytes,
+        "decompressor_with_prior_zip_bytes": local_decompressor_bytes,
+        "prior_archive_bytes": (
+            prior_info["archive_bytes"] if prior_info is not None else 0),
+        "prior_transmission_bytes": prior_transmission_bytes,
+        "initial_prior_sha256": (
+            prior_info["archive_sha256"] if prior_info is not None else None),
+        "prior_source_depth": (
+            prior_info["source_depth"] if prior_info is not None else 0),
+        "prior_initialization_kind": (
+            prior_info["initialization_kind"]
+            if prior_info is not None else None),
+        "prior_block_mapping": (
+            prior_info["block_mapping"] if prior_info is not None else None),
+        "prior_policy": (
+            prior_info["metadata"].get("policy")
+            if prior_info is not None else None),
+        "estimated_benchmark_total_bytes": estimated_total_bytes,
+        "estimated_benchmark_total_bits_per_byte": (
+            estimated_total_bytes * 8.0 / args.raw_bytes
+            if estimated_total_bytes is not None and args.raw_bytes else None),
+        "benchmark_total_bytes": benchmark_total_bytes,
+        "benchmark_total_bits_per_byte": benchmark_total_bpb,
+        "elapsed_seconds": total_time,
+    }
+    log("FINAL_RESULT " + json.dumps(final_result, sort_keys=True))
 
     if dependency_accounted:
         size_summary = "{:.0f} bytes (+ {} decompressor = {:.0f} total)".format(
