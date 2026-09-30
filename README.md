@@ -1,15 +1,19 @@
-# tufazip
+# tufazip v2
 
-Deterministic decoder for the 105,924,360-byte `enwik9.bin` artifact.
+Blog: https://tufalabs.ai/research/tufazip
+
+Tweet: https://x.com/tufalabs/status/2123350647273631907
+
+Deterministic decoder for the 100,958,324-byte `enwik9-v2.bin` artifact.
 
 ## Run
 
 Requirements: Linux x86-64, exactly two visible NVIDIA B200 GPUs, GCC, CUDA
-13.0, cuDNN 9.20, and [uv](https://docs.astral.sh/uv/).
+13.0, cuDNN 9.20, Python 3.12.3, and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync --frozen
-uv run ./tufazip /path/to/enwik9.bin /path/to/enwik9 /path/to/state
+uv sync --frozen --python 3.12.3
+uv run --frozen --python 3.12.3 ./tufazip /path/to/enwik9-v2.bin /path/to/enwik9 /path/to/state
 ```
 
 The state directory is optional and only stores resumable checkpoints. If the
@@ -19,41 +23,35 @@ Expected files:
 
 | File | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `enwik9.bin` | 105,924,360 | `a61841fcaac31d9db9b70dab797ac43f7502fc526326e1e9a326bdde8d24d01b` |
+| `enwik9-v2.bin` | 100,958,324 | `198451a21f64386b487b8ea97e141562db355eec9cc9af34e7bbb6a022bcce77` |
+| `weights.bin` | 4,334,741 | `e94c089f8eb985a87307dca3a7702385fcaccd14d95743811f8788f7da24448d` |
 | decoded `enwik9` | 1,000,000,000 | `159b85351e5f76e60cbe32e04c677847a9ecba3adc79addab6f4c6c7aa3744bc` |
 
 ## Submission data
 
 | Field | Value |
 | --- | --- |
-| Program and version | `tufazip 0.1.0` |
+| Program and version | `tufazip v2` |
 | Author | Tommy He |
-| Public download | https://github.com/Tufalabs/tufazip |
+| Repository | https://github.com/Tufalabs/tufazip |
 | Compressed enwik8 | - |
-| Compressed enwik9 | 105,924,360 bytes |
-| Decompressor ZIP | 54,709 bytes |
-| Ranked total | **105,979,069 bytes** |
-| Compression time | ~ 647,595 seconds |
-| Decompression time | ~ 630,136 seconds |
-| Peak compression memory | 23.55 GiB host + 43.37 GiB aggregate GPU; ~ 68,525 MiB total |
-| Peak decompression memory | 28.65 GiB host + 43.37 GiB aggregate GPU; ~ 73,748 MiB total |
-| Machine | NVIDIA DGX B200; 2× B200 GPUs; 2× Intel Xeon Platinum 8570; Linux x86-64 |
-| Runtime | Python 3.12.3; NumPy 2.4.6; PyTorch 2.12.0+cu130; CUDA 13.0; cuDNN 9.20; driver 580.159.04 |
-| Algorithm | Online Transformer |
+| Compressed enwik9 | 100,958,324 bytes |
+| Decompressor ZIP | 4,430,029 bytes |
+| Ranked total | 105,388,353 bytes |
+| Compression time | ~ 631,548 seconds, excluding offline training |
+| Decompression time | ~ 645,748 seconds |
+| Machine | 2× NVIDIA B200 GPUs; Linux x86-64 |
+| Runtime | Python 3.12.3; NumPy 2.4.6; PyTorch 2.12.0+cu130; CUDA 13.0; cuDNN 9.20 |
+| Algorithm | Online Transformer initialized from a quantized offline Cycle2 prior |
 
-The reported ZIP is an Info-ZIP `zip -9 -X` archive containing only the files
-needed to install and run the decompressor:
+The reported ZIP is the original verified decoder archive, including the
+weights and vocabulary. The ranked total is
+`100,958,324 + 4,430,029 = 105,388,353` bytes.
 
-```bash
-zip -9 -X tufazip-decompressor.zip \
-  tufazip nn.py arithmetic_coder.py checkpoint_utils.py \
-  preprocess.c cutils.h Makefile enwik9.voc pyproject.toml uv.lock
-unzip -t tufazip-decompressor.zip
-wc -c tufazip-decompressor.zip
-```
-
-The ranked total is `105,924,360 + 54,709 = 105,979,069` bytes.
+v1, with its original decoder and run instructions, is available at
+[commit 794dda3](https://github.com/Tufalabs/tufazip/tree/794dda3e097957619177f83baf20a4fd0d33b51f).
 
 ## Acknowledgements
+
 - Thanks to Jerome Sieber for providing mentorship and advising for this project and Tufa Labs for the providing the compute and capacity to work on this project!
 - Thanks to Matt Mahoney for creating and maintaining the Large Text Compression Benchmark (https://www.mattmahoney.net/dc/text.html) still after 20 years! as well as his online textbook Data Compression Explained (https://mattmahoney.net/dc/dce.html)!

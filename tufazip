@@ -1,102 +1,145 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""Decode tufazip v2; model settings and weight loading live in nn.py."""
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python="${TUFAZIP_PYTHON:-python3}"
-input="${1:?usage: ./tufazip enwik9.bin enwik9 [state-directory]}"
-output="${2:?usage: ./tufazip enwik9.bin enwik9 [state-directory]}"
-state="${3:-$PWD/tufazip-state}"
-test "$#" -le 3 || { echo "usage: ./tufazip enwik9.bin enwik9 [state-directory]" >&2; exit 2; }
-
-check() {
-    test -f "$1" || { echo "missing: $1" >&2; exit 1; }
-    test "$(wc -c < "$1" | tr -d '[:space:]')" = "$2" || {
-        echo "wrong size: $1" >&2; exit 1;
-    }
-    test "$(sha256sum "$1" | awk '{print $1}')" = "$3" || {
-        echo "wrong SHA-256: $1" >&2; exit 1;
-    }
-}
-
-check "$input" 105924360 a61841fcaac31d9db9b70dab797ac43f7502fc526326e1e9a326bdde8d24d01b
-check "$root/enwik9.voc" 34421 a63e517783e84a778f3f08c1f2321f3e2035e64d34c8e9206f03591460e44629
-
-"$python" - <<'PY'
+import argparse
+import hashlib
 import importlib.metadata
+import os
+from pathlib import Path
 import platform
+import signal
+import subprocess
 import sys
-import numpy
-import torch
 
-expected = (
-    ("Python", platform.python_version(), "3.12.3"),
-    ("NumPy", numpy.__version__, "2.4.6"),
-    ("PyTorch", torch.__version__, "2.12.0+cu130"),
-    ("TensorBoard", importlib.metadata.version("tensorboard"), "2.20.0"),
-    ("CUDA", torch.version.cuda, "13.0"),
-    ("cuDNN", torch.backends.cudnn.version(), 92000),
-)
-errors = [f"{name}: found {actual!r}, expected {wanted!r}"
-          for name, actual, wanted in expected if actual != wanted]
-if not torch.cuda.is_available():
-    errors.append("CUDA is unavailable")
-elif torch.cuda.device_count() != 2:
-    errors.append(f"found {torch.cuda.device_count()} visible GPUs; expected 2")
-elif any("B200" not in torch.cuda.get_device_name(i) for i in range(2)):
-    errors.append("both visible GPUs must be NVIDIA B200s")
-if platform.machine() not in ("x86_64", "AMD64"):
-    errors.append("x86-64 is required")
-if errors:
-    print("unsupported deterministic runtime:\n  " + "\n  ".join(errors), file=sys.stderr)
-    sys.exit(1)
-PY
-
-mkdir -p "$state/checkpoint" "$state/run" "$(dirname "$output")"
-export CUBLAS_WORKSPACE_CONFIG=:4096:8
-export PYTHONHASHSEED=1111
-export NCCL_ALGO=Ring
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-rm -f "$state/checkpoint/STOP_REQUESTED"
-
-stop() {
-    echo "stopping after the next checkpoint; repeat this command to resume" >&2
-    touch "$state/checkpoint/STOP_REQUESTED"
+ROOT = Path(__file__).resolve().parent
+DETERMINISTIC_ENV = {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "PYTHONHASHSEED": "1111",
+    "NCCL_ALGO": "Ring",
+    "NCCL_DEBUG": "WARN",
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
+    "OMP_NUM_THREADS": "1",
 }
-trap stop USR1 TERM INT
+PAYLOAD_SHA256 = "198451a21f64386b487b8ea97e141562db355eec9cc9af34e7bbb6a022bcce77"
+VOCAB_SHA256 = "a63e517783e84a778f3f08c1f2321f3e2035e64d34c8e9206f03591460e44629"
+WEIGHTS_SHA256 = "e94c089f8eb985a87307dca3a7702385fcaccd14d95743811f8788f7da24448d"
+TOKENS_SHA256 = "102fa82b3f8932b37a1ec0d9262e555d23d17852685fe5fb33680dbee19dd694"
+RAW_SHA256 = "159b85351e5f76e60cbe32e04c677847a9ecba3adc79addab6f4c6c7aa3744bc"
 
-if ! test -f "$state/checkpoint/DONE"; then
-    set +e
-    "$python" -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node=2 \
-        "$root/nn.py" --distributed --decompress \
-        --input "$input" --output "$state/enwik9.pp" \
-        --raw_bytes 1000000000 --vocab_bytes 34421 \
-        --model_backend transformer --vocab_size 4097 --tokenizer word \
-        --n_layer 12 --d_model 1024 --n_head 8 --d_inner 2816 \
-        --ctx_len 192 --untie_embeddings --dropout 0.25 \
-        --batch_size 64 --block_len 500000 \
-        --online_loss code --project_only_targets \
-        --lr 4e-5 --min_lr_ratio 0.25 --warmup 200 \
-        --clip 0.25 --beta1 0 --beta2 0.9999 --adam_eps 1e-9 \
-        --retrain_period 1 --retrain_len 35000000 --retrain_epochs 1 \
-        --retrain_batch_size 32 --retrain_update_len 64 \
-        --retrain_lr 1.6e-4,13000,1.6e-4,93000,7.9e-5,163000,4.0e-5,1911300,1.3e-5 \
-        --position_type rope --norm_style peri --seed 1111 --dtype bf16 \
-        --log_interval 100000 --run_dir "$state/run" \
-        --checkpoint_dir "$state/checkpoint" --checkpoint_every_blocks 2 &
-    pid=$!
-    while true; do
-        wait "$pid"
-        status=$?
-        ! kill -0 "$pid" 2>/dev/null && break
-    done
-    set -e
-    test "$status" -eq 0 || exit "$status"
-fi
 
-check "$state/enwik9.pp" 570405660 102fa82b3f8932b37a1ec0d9262e555d23d17852685fe5fb33680dbee19dd694
-gcc -O3 -Wall -Wpointer-arith -g -fno-math-errno -fno-trapping-math \
-    -Wno-format-truncation -DCONFIG_VERSION=\"tufazip\" \
-    -I"$root" "$root/preprocess.c" -lm -o "$state/preprocess"
-"$state/preprocess" d "$root/enwik9.voc" "$state/enwik9.pp" "$output"
-check "$output" 1000000000 159b85351e5f76e60cbe32e04c677847a9ecba3adc79addab6f4c6c7aa3744bc
-echo "decoded and verified: $output"
+def check_file(path, size, expected_hash):
+    if not path.is_file():
+        raise ValueError(f"Missing file: {path}")
+    if path.stat().st_size != size:
+        raise ValueError(f"Wrong size: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected_hash:
+        raise ValueError(f"Wrong SHA-256: {path}")
+
+
+def check_runtime():
+    import numpy
+    import torch
+
+    expected = (
+        ("Python", platform.python_version(), "3.12.3"),
+        ("NumPy", numpy.__version__, "2.4.6"),
+        ("PyTorch", torch.__version__, "2.12.0+cu130"),
+        ("TensorBoard", importlib.metadata.version("tensorboard"), "2.20.0"),
+        ("CUDA", torch.version.cuda, "13.0"),
+        ("cuDNN", torch.backends.cudnn.version(), 92000),
+    )
+    errors = [f"{name}: found {actual!r}, expected {wanted!r}"
+              for name, actual, wanted in expected if actual != wanted]
+    if not torch.cuda.is_available():
+        errors.append("CUDA is unavailable")
+    elif torch.cuda.device_count() != 2:
+        errors.append(f"Found {torch.cuda.device_count()} visible GPUs; expected 2")
+    elif any("B200" not in torch.cuda.get_device_name(i) for i in range(2)):
+        errors.append("Both visible GPUs must be NVIDIA B200s")
+    if platform.machine() not in ("x86_64", "AMD64"):
+        errors.append("x86-64 is required")
+    if errors:
+        raise RuntimeError("Unsupported deterministic runtime:\n  " + "\n  ".join(errors))
+
+
+def codec_command(payload, state):
+    return [
+        sys.executable, "-m", "torch.distributed.run", "--standalone",
+        "--nnodes=1", "--nproc_per_node=2", str(ROOT / "nn.py"),
+        "--decompress", "--input", str(payload),
+        "--output", str(state / "enwik9.pp"),
+        "--checkpoint_dir", str(state / "checkpoint"),
+        "--run_dir", str(state / "run"),
+    ]
+
+
+def decode(payload, state):
+    checkpoint = state / "checkpoint"
+    stop_file = checkpoint / "STOP_REQUESTED"
+    stop_file.unlink(missing_ok=True)
+    if (checkpoint / "DONE").exists():
+        return 0
+
+    def stop(signum, frame):
+        print("Stopping at the next checkpoint; repeat this command to resume.",
+              file=sys.stderr)
+        stop_file.touch()
+
+    handlers = {sig: signal.signal(sig, stop)
+                for sig in (signal.SIGUSR1, signal.SIGTERM, signal.SIGINT)}
+    try:
+        # Keep terminal signals in the launcher so the codec can checkpoint.
+        with subprocess.Popen(codec_command(payload, state), start_new_session=True) as child:
+            return child.wait()
+    finally:
+        for sig, handler in handlers.items():
+            signal.signal(sig, handler)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Decode and verify tufazip v2 enwik9.")
+    parser.add_argument("--version", action="version", version="tufazip v2")
+    parser.add_argument("payload", type=Path, help="enwik9-v2.bin")
+    parser.add_argument("output", type=Path, help="decoded enwik9")
+    parser.add_argument("state", nargs="?", type=Path, default=Path("tufazip-v2-state"),
+                        help="resumable state directory (default: ./tufazip-v2-state)")
+    args = parser.parse_args()
+    payload, output, state = (p.expanduser().resolve()
+                              for p in (args.payload, args.output, args.state))
+    check_file(payload, 100958324, PAYLOAD_SHA256)
+    check_file(ROOT / "enwik9.voc", 34421, VOCAB_SHA256)
+    check_file(ROOT / "weights.bin", 4334741, WEIGHTS_SHA256)
+    os.environ.update(DETERMINISTIC_ENV)
+    check_runtime()
+    (state / "checkpoint").mkdir(parents=True, exist_ok=True)
+    (state / "run").mkdir(parents=True, exist_ok=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    result = decode(payload, state)
+    if result:
+        return result if result > 0 else 1
+
+    check_file(state / "enwik9.pp", 570405660, TOKENS_SHA256)
+    preprocessor = state / "preprocess"
+    subprocess.run([
+        "gcc", "-O3", "-Wall", "-Wpointer-arith", "-g",
+        "-fno-math-errno", "-fno-trapping-math", "-Wno-format-truncation",
+        '-DCONFIG_VERSION="tufazip v2"', str(ROOT / "preprocess.c"),
+        "-lm", "-o", str(preprocessor),
+    ], check=True)
+    subprocess.run([str(preprocessor), "d", str(ROOT / "enwik9.voc"),
+                    str(state / "enwik9.pp"), str(output)], check=True)
+    check_file(output, 1000000000, RAW_SHA256)
+    print(f"Decoded and verified: {output}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
+        print(f"tufazip: {error}", file=sys.stderr)
+        sys.exit(1)
