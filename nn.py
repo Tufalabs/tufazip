@@ -80,14 +80,15 @@ FREQ_TOTAL = 10_000_000  # frequency-table resolution handed to the arithmetic c
 # Files that must ship with this script to decompress its output, used for the
 # Matt Mahoney "total size" benchmark (compressed bytes + DEFLATE-9 zip of these).
 # Which detokenizer source is needed depends on the tokenizer: the C 'word' path
-# needs the standalone preprocess.c source; the
-# byte*/bpe* paths need tokenizers.py instead.
+# needs only the decode half of preprocess.c (detok.c); the
+# byte*/bpe* paths need tokenizers.py instead.  Size accounting only: these
+# lists never influence predictions or the bitstream.
 DECOMPRESSOR_COMMON = (
     "nn.py", "arithmetic_coder.py", "checkpoint_utils.py")
 DECOMPRESSOR_MAMBA = (
     "ssm_models.py", "mamba_ssm_commit.txt", "mamba_ssm_compat.py")
 DECOMPRESSOR_KDA = ("ssm_models.py", "kda_models.py", "fla_commit.txt")
-DECOMPRESSOR_WORD = ("preprocess.c",)
+DECOMPRESSOR_WORD = ("detok.c",)
 DECOMPRESSOR_STRUCTURED = ("structured_word_transform.py",)
 DECOMPRESSOR_PY = ("tokenizers.py",)
 

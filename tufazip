@@ -23,6 +23,7 @@ DETERMINISTIC_ENV = {
 PAYLOAD_SHA256 = "198451a21f64386b487b8ea97e141562db355eec9cc9af34e7bbb6a022bcce77"
 VOCAB_SHA256 = "a63e517783e84a778f3f08c1f2321f3e2035e64d34c8e9206f03591460e44629"
 WEIGHTS_SHA256 = "e94c089f8eb985a87307dca3a7702385fcaccd14d95743811f8788f7da24448d"
+PACKED_WEIGHTS_SHA256 = "ab55ebd0d7d63e3c2b6731489a9f8c2e03bb18eb67d8bc5b39325d34d100199a"
 TOKENS_SHA256 = "102fa82b3f8932b37a1ec0d9262e555d23d17852685fe5fb33680dbee19dd694"
 RAW_SHA256 = "159b85351e5f76e60cbe32e04c677847a9ecba3adc79addab6f4c6c7aa3744bc"
 
@@ -74,6 +75,7 @@ def codec_command(payload, state):
         "--output", str(state / "enwik9.pp"),
         "--checkpoint_dir", str(state / "checkpoint"),
         "--run_dir", str(state / "run"),
+        "--initial_prior", str(state / "weights.bin"),
     ]
 
 
@@ -112,25 +114,26 @@ def main():
                               for p in (args.payload, args.output, args.state))
     check_file(payload, 100958324, PAYLOAD_SHA256)
     check_file(ROOT / "enwik9.voc", 34421, VOCAB_SHA256)
-    check_file(ROOT / "weights.bin", 4334741, WEIGHTS_SHA256)
+    check_file(ROOT / "weights.tz", 4147476, PACKED_WEIGHTS_SHA256)
     os.environ.update(DETERMINISTIC_ENV)
     check_runtime()
     (state / "checkpoint").mkdir(parents=True, exist_ok=True)
     (state / "run").mkdir(parents=True, exist_ok=True)
     output.parent.mkdir(parents=True, exist_ok=True)
+    # Rebuild the exact transmitted prior (lossless; see wunpack.py).
+    sys.path.insert(0, str(ROOT))
+    import wunpack
+    wunpack.unpack(ROOT / "weights.tz", state / "weights.bin")
+    check_file(state / "weights.bin", 4334741, WEIGHTS_SHA256)
     result = decode(payload, state)
     if result:
         return result if result > 0 else 1
 
     check_file(state / "enwik9.pp", 570405660, TOKENS_SHA256)
-    preprocessor = state / "preprocess"
-    subprocess.run([
-        "gcc", "-O3", "-Wall", "-Wpointer-arith", "-g",
-        "-fno-math-errno", "-fno-trapping-math", "-Wno-format-truncation",
-        '-DCONFIG_VERSION="tufazip v2"', str(ROOT / "preprocess.c"),
-        "-lm", "-o", str(preprocessor),
-    ], check=True)
-    subprocess.run([str(preprocessor), "d", str(ROOT / "enwik9.voc"),
+    detok = state / "detok"
+    subprocess.run(["gcc", "-O2", str(ROOT / "detok.c"), "-o", str(detok)],
+                   check=True)
+    subprocess.run([str(detok), str(ROOT / "enwik9.voc"),
                     str(state / "enwik9.pp"), str(output)], check=True)
     check_file(output, 1000000000, RAW_SHA256)
     print(f"Decoded and verified: {output}")
